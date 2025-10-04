@@ -1,4 +1,10 @@
 {
+  "xpow": {
+    "api_key": "your-xpow-api-key-here"
+  },
+  "rates_api": {
+    "api_key": "your-rates-api-key-here"
+  },
   "dpow": {
     "user": "user",
     "key": "key"

@@ -66,9 +66,12 @@ const mynano_ninja_url = 'https://mynano.ninja/api/accounts/verified'
 //const CMC_API_KEY = 'xxx'
 const API_TIMEOUT: number = 20000 // 10sec timeout for calling http APIs
 const work_threshold_default: string = 'fffffff800000000'
-const work_default_timeout: number = 10 // x sec timeout before trying next delegated work method (only when use_dpow or use_bpow)
+const work_default_timeout: number = 10 // x sec timeout before trying next delegated work method (only when use_xpow, use_dpow or use_bpow)
+const xpow_url: string = 'https://pow.xnopay.com'
 const bpow_url: string = 'https://bpow.banano.cc/service/'
 const dpow_url: string = 'https://dpow-api.nanos.cc/service/'
+const rates_api_url: string = 'https://common.xnopay.com/rates-api/rates/'
+const currencies_api_url: string = 'https://common.xnopay.com/rates-api/rates/currencies'
 const work_token_cost = 10 // work_generate will consume x token points
 let ws: ReconnectingWebSocket | null = null
 let global_tracked_accounts: string[] = [] // the accounts to track in websocket (synced with database)
@@ -549,7 +552,7 @@ async function getOrFetchPrice(): Promise<PriceResponse | undefined> {
       //res.json({"Price USD":data.quotes.USD.price}) // sending back json price response (Coinpaprika)
       return data // sending back full json price response (Coinpaprika)
     } catch (err) {
-      logThis(`Failed looking up price: ${err.toString()}`, log_levels.warning)
+      logThis(`Failed looking up price: ${(err as Error).toString()}`, log_levels.warning)
       return undefined
     } finally {
       endPriceTimer?.()
@@ -641,9 +644,71 @@ async function processRequest(query: ProxyRPCRequest, req: Request, res: Respons
       return res.json(appendRateLimiterStatus(res, data.map(mynanoToVerifiedAccount)))
     }
     catch(err) {
-      return res.status(500).json({error: err.toString()})
+      return res.status(500).json({error: (err as Error).toString()})
     } finally {
       endVerifiedAccountsTimer?.()
+    }
+  }
+
+  if (query.action === 'fetch_rates') {
+    try {
+      // Use cached value first
+      const cachedValue: any = rpcCache?.get('fetch_rates')
+      if (cachedValue && Tools.isValidJson(cachedValue)) {
+        logThis("Cache requested: " + 'fetch_rates', log_levels.info)
+        if (tokens_left != null) {
+          cachedValue.tokens_total = tokens_left
+        }
+        return res.json(appendRateLimiterStatus(res, cachedValue))
+      }
+
+      if (!powSettings.rates_api || !powSettings.rates_api.api_key) {
+        return res.status(500).json({error: 'Rates API key not configured'})
+      }
+
+      let data: any = await Tools.getData(rates_api_url, API_TIMEOUT, { 'Authorization': `Bearer ${powSettings.rates_api.api_key}` })
+      // Store the rates in cache for 2 seconds
+      if (!rpcCache?.set('fetch_rates', data, 2)) {
+        logThis("Failed saving cache for " + 'fetch_rates', log_levels.warning)
+      }
+      if (tokens_left != null) {
+        data.tokens_total = tokens_left
+      }
+      return res.json(appendRateLimiterStatus(res, data))
+    }
+    catch(err) {
+      return res.status(500).json({error: (err as Error).toString()})
+    }
+  }
+
+  if (query.action === 'fetch_currencies') {
+    try {
+      // Use cached value first
+      const cachedValue: any = rpcCache?.get('fetch_currencies')
+      if (cachedValue && Tools.isValidJson(cachedValue)) {
+        logThis("Cache requested: " + 'fetch_currencies', log_levels.info)
+        if (tokens_left != null) {
+          return res.json(appendRateLimiterStatus(res, { currencies: cachedValue, tokens_total: tokens_left }))
+        }
+        return res.json(appendRateLimiterStatus(res, cachedValue))
+      }
+
+      if (!powSettings.rates_api || !powSettings.rates_api.api_key) {
+        return res.status(500).json({error: 'Rates API key not configured'})
+      }
+
+      let data: any = await Tools.getData(currencies_api_url, API_TIMEOUT, { 'Authorization': `Bearer ${powSettings.rates_api.api_key}` })
+      // Store the currencies in cache for 12 hours (43200 seconds)
+      if (!rpcCache?.set('fetch_currencies', data, 43200)) {
+        logThis("Failed saving cache for " + 'fetch_currencies', log_levels.warning)
+      }
+      if (tokens_left != null) {
+        return res.json(appendRateLimiterStatus(res, { currencies: data, tokens_total: tokens_left }))
+      }
+      return res.json(appendRateLimiterStatus(res, data))
+    }
+    catch(err) {
+      return res.status(500).json({error: (err as Error).toString()})
     }
   }
 
@@ -674,9 +739,10 @@ async function processRequest(query: ProxyRPCRequest, req: Request, res: Respons
     }
   }
 
-  // Handle work generate via dpow and/or bpow
-  if (query.action === 'work_generate' && (settings.use_dpow || settings.use_bpow || settings.use_work_server || settings.use_work_peers)) {
+  // Handle work generate via xpow, dpow and/or bpow
+  if (query.action === 'work_generate' && (settings.use_xpow || settings.use_dpow || settings.use_bpow || settings.use_work_server || settings.use_work_peers)) {
     if (query.hash) {
+      let xpow_failed = false
       let bpow_failed = false
       let dpow_failed = false
       // Set difficulty to SEND default if it was not defined
@@ -688,13 +754,46 @@ async function processRequest(query: ProxyRPCRequest, req: Request, res: Respons
         query.timeout = work_default_timeout
       }
 
-      if (settings.use_work_peers && !settings.use_bpow && !settings.use_dpow && !settings.use_work_server) {
-        //Only add use_peers when _NOT_ using any of bpow or dpow.
+      if (settings.use_work_peers && !settings.use_xpow && !settings.use_bpow && !settings.use_dpow && !settings.use_work_server) {
+        //Only add use_peers when _NOT_ using any of xpow, bpow or dpow.
         query.use_peers = "true"
       }
 
-      // Try bpow first
-      if (settings.use_bpow && powSettings.bpow) {
+      // Try xpow first
+      if (settings.use_xpow && powSettings.xpow) {
+        logThis("Requesting work using xpow with diff: " + query.difficulty, log_levels.info)
+
+        try {
+          let data: ProcessDataResponse = await Tools.postData(query, xpow_url, work_default_timeout*1000*2, { 'api-key': powSettings.xpow.api_key })
+          data.difficulty = query.difficulty
+          data.multiplier = multiplierFromDifficulty(data.difficulty, work_threshold_default)
+          if (tokens_left != null) {
+            data.tokens_total = tokens_left
+          }
+          // if xpow time out
+          if (data.error) {
+            logThis("xPoW failed: " + data.error, log_levels.warning)
+          }
+          if ((data.error) || !(data.work)) {
+            xpow_failed = true
+            if (!settings.use_bpow && !settings.use_dpow) {
+              return res.json(appendRateLimiterStatus(res, data)) // forward error if not retrying with bpow or dpow
+            }
+          }
+          else if (data.work) {
+            return res.json(appendRateLimiterStatus(res, data)) // sending back successful json response
+          }
+        }
+        catch(err) {
+          xpow_failed = true
+          logThis("xPoW connection error: " + (err as Error).toString(), log_levels.warning)
+          if (!settings.use_bpow && !settings.use_dpow) {
+            return res.status(500).json({error: (err as Error).toString()})
+          }
+        }
+      }
+      // Try bpow if xpow failed or not enabled
+      if ((!settings.use_xpow || xpow_failed) && settings.use_bpow && powSettings.bpow) {
         logThis("Requesting work using bpow with diff: " + query.difficulty, log_levels.info)
         query.user = powSettings.bpow.user
         query.api_key = powSettings.bpow.key
@@ -712,7 +811,7 @@ async function processRequest(query: ProxyRPCRequest, req: Request, res: Respons
           }
           if ((data.error) || !(data.work)) {
             bpow_failed = true
-            if (!settings.use_dpow) {
+            if (!settings.use_dpow && !settings.use_work_server) {
               return res.json(appendRateLimiterStatus(res, data)) // forward error if not retrying with dpow
             }
           }
@@ -722,14 +821,14 @@ async function processRequest(query: ProxyRPCRequest, req: Request, res: Respons
         }
         catch(err) {
           bpow_failed = true
-          logThis("Bpow connection error: " + err.toString(), log_levels.warning)
-          if (!settings.use_dpow) {
-            return res.status(500).json({error: err.toString()})
+          logThis("Bpow connection error: " + (err as Error).toString(), log_levels.warning)
+          if (!settings.use_dpow && !settings.use_work_server) {
+            return res.status(500).json({error: (err as Error).toString()})
           }
         }
       }
-      // Use dpow only if not already used bpow or bpow timed out
-      if ((!settings.use_bpow || bpow_failed) && settings.use_dpow && powSettings.dpow) {
+      // Use dpow only if not already used xpow/bpow or xpow/bpow timed out
+      if ((!settings.use_xpow && !settings.use_bpow || xpow_failed || bpow_failed) && settings.use_dpow && powSettings.dpow) {
         logThis("Requesting work using dpow with diff: " + query.difficulty, log_levels.info)
         query.user = powSettings.dpow.user
         query.api_key = powSettings.dpow.key
@@ -756,14 +855,14 @@ async function processRequest(query: ProxyRPCRequest, req: Request, res: Respons
         }
         catch(err) {
           dpow_failed = true
-          logThis("Dpow connection error: " + err.toString(), log_levels.warning)
+          logThis("Dpow connection error: " + (err as Error).toString(), log_levels.warning)
           if (!settings.use_work_server) {
-            return res.status(500).json({error: err.toString()})
+            return res.status(500).json({error: (err as Error).toString()})
           }
         }
       }
-      // Use work server only if not already used bpow/dpow or bpow/dpow timed out
-      if (((!settings.use_bpow && !settings.use_dpow) || (bpow_failed || dpow_failed)) && settings.use_work_server && powSettings.work_server) {
+      // Use work server only if not already used xpow/bpow/dpow or xpow/bpow/dpow timed out
+      if (((!settings.use_xpow && !settings.use_bpow && !settings.use_dpow) || (xpow_failed || bpow_failed || dpow_failed)) && settings.use_work_server && powSettings.work_server) {
         logThis("Requesting work using work server with diff: " + query.difficulty, log_levels.info)
 
         try {
@@ -779,8 +878,8 @@ async function processRequest(query: ProxyRPCRequest, req: Request, res: Respons
           return res.json(appendRateLimiterStatus(res, data)) // sending back json response (regardless if timeout error)
         }
         catch(err) {
-          logThis("Work server connection error: " + err.toString(), log_levels.warning)
-          return res.status(500).json({error: err.toString()})
+          logThis("Work server connection error: " + (err as Error).toString(), log_levels.warning)
+          return res.status(500).json({error: (err as Error).toString()})
         }
       }
     }
@@ -853,8 +952,8 @@ async function processRequest(query: ProxyRPCRequest, req: Request, res: Respons
     return res.json(appendRateLimiterStatus(res, data)) // sending back json response
   }
   catch(err) {
-    logThis("Node conection error: " + err.toString(), log_levels.warning)
-    return res.status(500).json({error: err.toString()})
+    logThis("Node conection error: " + (err as Error).toString(), log_levels.warning)
+    return res.status(500).json({error: (err as Error).toString()})
   } finally {
     endNodeTimer?.()
   }

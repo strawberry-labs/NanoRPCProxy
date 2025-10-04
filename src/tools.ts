@@ -23,9 +23,14 @@ class APIError extends Error {
 }
 
 // Get data from URL. let data = await getData("url", TIMEOUT)
-export async function getData<data>(server: string, timeout: number): Promise<data> {
+export async function getData<data>(server: string, timeout: number, customHeaders?: Record<string, string>): Promise<data> {
+  let headers: Record<string, string> = {}
+  if (customHeaders) {
+    headers = { ...customHeaders }
+  }
   let options: any = {
     method: 'get',
+    headers: headers,
     timeout: timeout,
   }
 
@@ -41,11 +46,15 @@ export async function getData<data>(server: string, timeout: number): Promise<da
 }
 
 // Post data, for example to RPC node. let data = await postData({"action":"block_count"}, "url", TIMEOUT)
-export  async function postData<ResponseData>(data: any, server: string, timeout: number): Promise<ResponseData> {
+export  async function postData<ResponseData>(data: any, server: string, timeout: number, customHeaders?: Record<string, string>): Promise<ResponseData> {
+  let headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (customHeaders) {
+    headers = { ...headers, ...customHeaders }
+  }
   let options: any = {
     method: 'post',
     body:    JSON.stringify(data),
-    headers: { 'Content-Type': 'application/json' },
+    headers: headers,
     timeout: timeout,
   }
 
