@@ -1140,9 +1140,34 @@ if (settings.use_websocket) {
     })
     connection.on('close', function(reasonCode, description) {
       logThis('Websocket disconnected for: ' + remote_ip, log_levels.info)
+
+      // get disconnecting user's tracked accounts before removing from db
+      const disconnecting_user = tracking_db.get('users').find({ip: remote_ip}).value()
+      const disconnected_accounts: string[] = disconnecting_user?.tracked_accounts
+        ? Object.keys(disconnecting_user.tracked_accounts)
+        : []
+
       // clean up db and dictionary
       tracking_db.get('users').remove({ip: remote_ip}).write()
       websocket_connections.delete(remote_ip)
+
+      // clean up global_tracked_accounts: remove accounts no longer tracked by any user
+      if (disconnected_accounts.length > 0) {
+        const remaining_users = tracking_db.get('users').value()
+        const still_tracked = new Set<string>()
+        remaining_users.forEach((user: User) => {
+          if (user.tracked_accounts) {
+            for (const key of Object.keys(user.tracked_accounts)) {
+              still_tracked.add(key)
+            }
+          }
+        })
+        global_tracked_accounts = global_tracked_accounts.filter(
+          (account) => still_tracked.has(account)
+        )
+        // resubscribe with the updated list so the node knows
+        subscribeTrackedAccounts(false, 'cleanup')
+      }
     })
   })
 }
